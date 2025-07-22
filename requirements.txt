@@ -1,0 +1,29 @@
+# Core ML/AI Libraries
+torch>=2.0.0
+transformers>=4.40.0
+accelerate>=0.30.0
+datasets>=2.18.0
+
+# Parameter Efficient Fine-Tuning
+peft>=0.10.0
+
+# Quantization
+bitsandbytes>=0.43.0
+
+# Distributed Training
+deepspeed>=0.14.0
+
+# Optional Performance Optimizations
+liger_kernel>=0.2.0
+flash-attn>=2.5.0
+
+# Data Processing
+ujson>=5.9.0
+numpy>=1.24.0
+
+# Training Utilities
+tensorboard>=2.15.0
+wandb>=0.16.0
+
+# Development
+tqdm>=4.66.0
