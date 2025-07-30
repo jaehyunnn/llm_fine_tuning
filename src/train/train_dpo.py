@@ -1,16 +1,18 @@
+from typing import List, Tuple, Union, Dict, Any
+
 import os
-import torch
 import ast
 import pathlib
 import importlib
 
-from typing import List, Tuple, Union, Dict, Any
+import torch
 
 from transformers import HfArgumentParser, PreTrainedModel, PreTrainedTokenizer
-from src.model import ModelLoader, get_model_config, ModelConfig
-from src.train.trainer import SFTTrainer
-from src.dataset import get_sft_dataset
-from src.params import DataArguments, ModelArguments, SFTArguments
+
+from src.model import ModelLoader, ModelConfig, get_model_config
+from src.train.trainer import CustomDPOTrainer
+from src.dataset import get_dpo_dataset
+from src.params import DataArguments, ModelArguments, DPOArguments
 from src.train.utils import get_peft_state_dict, get_base_model_state_dict, save_hf_trainer_model
 
 local_rank = None
@@ -82,7 +84,7 @@ def apply_liger_optimizations(model_config: ModelConfig, use_liger: bool) -> Non
     except Exception as e:
         print_rank0(f"An error occurred while applying Liger optimizations: {e}")
 
-def configure_training_args(training_args: SFTArguments, model_config: ModelConfig) -> None:
+def configure_training_args(training_args: DPOArguments, model_config: ModelConfig) -> None:
     """Configure and validate training arguments."""
     
     # LoRA validation
@@ -100,19 +102,19 @@ def configure_training_args(training_args: SFTArguments, model_config: ModelConf
     if training_args.max_seq_length is None:
         training_args.max_seq_length = model_config.default_max_length
         print_rank0(f"Set max_seq_length to {model_config.default_max_length} from model config")
-        
+
 def create_data_module(model_config: ModelConfig, processor: PreTrainedTokenizer, data_args: DataArguments) -> Dict[str, Any]:
     """Create data module based on model type."""
     
-    return get_sft_dataset(
+    return get_dpo_dataset(
         model_id=model_config.model_name,
         processor=processor,
         data_args=data_args
     )
 
-def parse_arguments() -> Tuple[ModelArguments, DataArguments, SFTArguments]:
+def parse_arguments() -> Tuple[ModelArguments, DataArguments, DPOArguments]:
     """Parse command-line arguments for model, data, and training."""
-    parser = HfArgumentParser((ModelArguments, DataArguments, SFTArguments))
+    parser = HfArgumentParser((ModelArguments, DataArguments, DPOArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     return model_args, data_args, training_args
 
@@ -131,7 +133,7 @@ def get_and_print_model_config(model_args: ModelArguments) -> ModelConfig:
 
 def load_model_and_tokenizer(
     model_config: ModelConfig, 
-    training_args: SFTArguments
+    training_args: DPOArguments
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizer]:
     """Load model, tokenizer, and processor."""
     model_loader = ModelLoader(model_config, training_args)
@@ -143,7 +145,7 @@ def load_model_and_tokenizer(
     print_rank0(f"🟢 Model dtype: {next(model.parameters()).dtype}")
     return model, tokenizer, processor
 
-def start_training_or_resume(trainer: SFTTrainer, training_args: SFTArguments) -> None:
+def start_training_or_resume(trainer: CustomDPOTrainer, training_args: DPOArguments) -> None:
     """Run training, resuming from checkpoint if available."""
     checkpoint_dir = pathlib.Path(training_args.output_dir)
     if list(checkpoint_dir.glob("checkpoint-*")):
@@ -153,7 +155,7 @@ def start_training_or_resume(trainer: SFTTrainer, training_args: SFTArguments) -
         trainer.train()
     trainer.save_state()
 
-def finalize_and_save_model(trainer: SFTTrainer, model: PreTrainedModel, tokenizer_or_processor: PreTrainedTokenizer, training_args: SFTArguments) -> None:
+def finalize_and_save_model(trainer: CustomDPOTrainer, model: PreTrainedModel, tokenizer_or_processor: PreTrainedTokenizer, training_args: DPOArguments) -> None:
     """Save the final trained model."""
     model.config.use_cache = True
     
@@ -188,14 +190,23 @@ def train() -> None:
     apply_liger_optimizations(model_config, use_liger)
     
     model, tokenizer, processor = load_model_and_tokenizer(model_config, training_args)
+    # Load reference model if not using LoRA
+    ref_model = None
+    if not training_args.use_lora:
+        ref_model_loader = ModelLoader(model_config, training_args)
+        ref_model, _, _ = ref_model_loader.load_model_and_tokenizer()
+        
     data_module = create_data_module(model_config, processor, data_args)
 
     tokenizer_or_processor = processor if processor is not None else tokenizer
-    trainer = SFTTrainer(
+    trainer = CustomDPOTrainer(
         model=model,
-        processing_class=tokenizer_or_processor,
+        ref_model=ref_model,
+        train_dataset=data_module["train_dataset"],
+        eval_dataset=data_module["eval_dataset"] if "eval_dataset" in data_module else None,
+        data_collator=data_module["data_collator"],
+        processing_class=processor if processor is not None else tokenizer,
         args=training_args,
-        **data_module
     )
 
     start_training_or_resume(trainer, training_args)

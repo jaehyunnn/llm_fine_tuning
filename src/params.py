@@ -1,7 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-from transformers import TrainingArguments as HFTrainingArguments
+from transformers import TrainingArguments
+from trl import DPOConfig
+from trl import GRPOConfig
 
 @dataclass
 class ModelArguments:
@@ -16,7 +18,7 @@ class ModelArguments:
     )
 
 @dataclass
-class TrainingArguments(HFTrainingArguments):
+class SFTArguments(TrainingArguments):
     """Arguments pertaining to the training configuration."""
     
     # General Training
@@ -73,6 +75,59 @@ class TrainingArguments(HFTrainingArguments):
     num_lora_modules: int = field(
         default=-1, 
         metadata={"help": "Number of LoRA modules to apply. -1 means all linear layers."}
+    )
+
+@dataclass
+class DPOArguments(DPOConfig):
+    cache_dir: Optional[str] = field(default=None)
+    optim: str = field(default="adamw_torch")
+    adam_beta1: float = field(default=0.9)
+    adam_beta2: float = field(default=0.999)
+    adam_epsilon: float = field(default=1e-8)
+
+    freeze_llm: bool = field(default=False)
+    disable_flash_attn2: bool = field(default=False)
+
+    max_seq_length: int = field(
+        default=None, # Will be set from model config
+        metadata={
+            "help":
+                "Maximum sequence length. Sequences will be right padded (and possibly truncated). If None, will use model's default."
+        },
+    )
+    double_quant: bool = field(
+        default=True,
+        metadata={"help": "Compress the quantization statistics through double quantization."}
+    )
+    quant_type: str = field(
+        default="nf4",
+        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
+    )
+    bits: int = field(
+        default=16,
+        metadata={"help": "How many bits to use."}
+    )
+    use_lora: bool = False
+    use_dora: bool = False
+    lora_rank: int = 64
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_weight_path: str = ""
+    lora_bias: str = "none"
+    lora_namespan_exclude: str = field(default=None, metadata={"help": "List of namespan to exclude for LoRA"})
+    num_lora_modules: int = -1
+    use_liger: bool = True
+    beta: float = field(
+        default=0.1,
+        metadata={"help": "The beta value for DPO."}
+    )
+    precompute_ref_log_probs: bool = field(
+        default=False,
+        metadata={"help": "Whether to precompute the reference log probabilities."}
+    )
+    dpo_loss:str = field(
+        default="sigmoid",
+        metadata={"help": "The type of DPO loss to use."}
     )
 
 @dataclass

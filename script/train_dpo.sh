@@ -4,7 +4,7 @@
 MODEL_NAME="Qwen/Qwen3-0.6B" 
 
 # Dataset
-JSON_DATA_PATH="/workspace/llm_full_fine_tuning/data/example_dataset.json"
+JSON_DATA_PATH="/workspace/llm_fine_tuning/data/example_dataset_dpo.json"
 
 # Training configuration
 GLOBAL_BATCH_SIZE=32
@@ -12,7 +12,7 @@ BATCH_PER_DEVICE=8
 NUM_DEVICES=1
 EPOCHS=100
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
-OUTPUT_DIR=output/fft_$(date +%Y%m%d_%H%M%S)
+OUTPUT_DIR=output/dpo_$(date +%Y%m%d_%H%M%S)
 DEEPSPEED_CONFIG=script/zero3.json
 
 export PYTHONPATH=src:$PYTHONPATH
@@ -27,10 +27,10 @@ echo "💠 Epochs: $EPOCHS"
 echo "💠 Output Dir: $OUTPUT_DIR"
 echo "💠 Deepspeed Config: $DEEPSPEED_CONFIG"
 echo ""
-echo "🔥 Starting Training..."
+echo "🔥 Starting Training(DPO)..."
 
 
-deepspeed src/train/train_sft.py \
+deepspeed src/train/train_dpo.py \
     --model_id $MODEL_NAME \
     --data_path $JSON_DATA_PATH \
     --output_dir $OUTPUT_DIR \
@@ -38,6 +38,9 @@ deepspeed src/train/train_sft.py \
     --num_train_epochs $EPOCHS \
     --per_device_train_batch_size $BATCH_PER_DEVICE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+    --dpo_loss "sigmoid" \
+    --precompute_ref_log_probs False \
+    --beta 0.1 \
     --use_liger True \
     --use_lora False \
     --use_dora False \
@@ -62,4 +65,6 @@ deepspeed src/train/train_sft.py \
     --save_strategy steps \
     --save_steps 500 \
     --save_total_limit 5 \
-    --dataloader_num_workers 4
+    --dataloader_num_workers 4 \
+    --max_prompt_length 512 \
+    --max_length 1024

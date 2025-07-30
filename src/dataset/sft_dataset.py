@@ -15,12 +15,10 @@ from src.const import (
     IGNORE_INDEX,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IM_END_TOKEN,
-    DEFAULT_PAD_TOKEN,
     SYSTEM_MESSAGE,
 )
 
 from .utils import pad_sequence
-
 
 __all__ = ['get_sft_dataset']
 

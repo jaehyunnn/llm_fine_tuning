@@ -1,26 +1,23 @@
+from typing import Optional, Any, List, Tuple
+
 import os
 import shutil
 import torch
-import torch.nn as nn
-from typing import Optional, Any, List, Tuple
+from torch import nn
+from typing import Union
+import torch.nn.functional as F
 
-try:
-    import bitsandbytes
-    HAS_BITSANDBYTES = True
-except ImportError:
-    HAS_BITSANDBYTES = False
 
-from transformers import Trainer
 from transformers.trainer import (
-    get_parameter_names,
     TRAINER_STATE_NAME,
     PREFIX_CHECKPOINT_DIR,
     logger,
     ExportableState,
     SaveStrategy
 )
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
+from trl import DPOTrainer
+from trl.trainer.utils import pad_to_length, flush_left, selective_log_softmax
 from src.train.utils import get_base_model_state_dict
 
 # Constant definitions
@@ -29,137 +26,130 @@ BASE_MODEL_STATE_DICT_NAME = "base_model_state_dict.bin"
 CONFIG_FILE_NAME = "config.json"
 
 
-class SFTTrainer(Trainer):
-    """
-    Supervised Fine-Tuning Trainer extending HuggingFace Trainer.
+class CustomDPOTrainer(DPOTrainer):
+    
+    def __init__(self, processing_class, *args, **kwargs):
+        super(CustomDPOTrainer, self).__init__(processing_class=processing_class, *args, **kwargs)
+        
+    def _prepare_dataset(
+        self,
+        dataset,
+        processing_class,
+        args,
+        dataset_name
+    ):
+        return dataset
+    
+    @staticmethod
+    def concatenated_inputs(
+        batch: dict[str, list | torch.LongTensor], padding_value: int
+    ) -> dict[str, torch.LongTensor]:
+        concatenated_batch = {}
 
-    Features:
-    - Do not apply weight decay to LayerNorm and bias parameters
-    - Keep embedding layers in fp32 when using BitsAndBytes Adam8bit
-    """
+        concatenated_batch['prompt_input_ids'] = torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0)
+        concatenated_batch['prompt_attention_mask'] = torch.cat([batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0)
+        
+        max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
 
-    def __init__(self, *args, **kwargs):
-        """Initialize SFTTrainer"""
-        super().__init__(*args, **kwargs)
-
-    def create_optimizer(self) -> torch.optim.Optimizer:
-        """
-        Create a custom optimizer.
-
-        Returns:
-            torch.optim.Optimizer: The created optimizer
-
-        Raises:
-            ValueError: If optimizer creation fails
-        """
-        if self.optimizer is not None:
-            logger.warning("Optimizer already exists. Returning existing optimizer.")
-            return self.optimizer
-
-        try:
-            # Separate parameters with and without weight decay
-            decay_params, no_decay_params = self._get_grouped_parameters()
-
-            optimizer_grouped_parameters = [
-                {
-                    "params": decay_params,
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": no_decay_params,
-                    "weight_decay": 0.0,
-                },
-            ]
-
-            # Create optimizer
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-
-            # Special handling for BitsAndBytes Adam8bit
-            if HAS_BITSANDBYTES and optimizer_cls.__name__ == "Adam8bit":
-                self._configure_bitsandbytes_optimizer()
-            elif not HAS_BITSANDBYTES and optimizer_cls.__name__ == "Adam8bit":
-                logger.warning(
-                    "BitsAndBytes not installed but Adam8bit optimizer requested. "
-                    "Embedding layers will not be optimized in fp32."
-                )
-
-        except Exception as e:
-            raise ValueError(f"Failed to create optimizer: {str(e)}") from e
-
-        return self.optimizer
-
-    def _get_grouped_parameters(self) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
-        """
-        Group parameters based on whether weight decay applies.
-
-        Returns:
-            Tuple[List, List]: (decay_params, no_decay_params)
-        """
-        # Get LayerNorm layer names
-        try:
-            decay_parameter_names = get_parameter_names(self.model, ALL_LAYERNORM_LAYERS)
-        except Exception as e:
-            logger.warning(f"Failed to get LayerNorm parameter names: {e}. Using empty list.")
-            decay_parameter_names = []
-
-        # Exclude bias parameters from weight decay
-        decay_parameter_names = [name for name in decay_parameter_names if "bias" not in name]
-        decay_parameter_names_set = set(decay_parameter_names)
-
-        # Group parameters in a single pass
-        decay_params = []
-        no_decay_params = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            if name in decay_parameter_names_set:
-                decay_params.append(param)
-            else:
-                no_decay_params.append(param)
-
-        logger.info(
-            f"Optimizer parameter groups - with weight decay: {len(decay_params)}, "
-            f"without weight decay: {len(no_decay_params)}"
+        concatenated_batch['completion_input_ids'] = torch.cat(
+            (
+                pad_to_length(batch["chosen_input_ids"], max_completion_length, pad_value=padding_value),
+                pad_to_length(batch["rejected_input_ids"], max_completion_length, pad_value=padding_value),
+            ),
         )
 
-        return decay_params, no_decay_params
+        concatenated_batch['completion_attention_mask'] = torch.cat(
+            (
+                pad_to_length(batch["chosen_attention_mask"], max_completion_length, pad_value=0),
+                pad_to_length(batch["rejected_attention_mask"], max_completion_length, pad_value=0),
+            ),
+        )
+        return concatenated_batch
 
-    def _configure_bitsandbytes_optimizer(self) -> None:
-        """
-        Configure BitsAndBytes Adam8bit optimizer.
-        Keep embedding layers in fp32 for improved accuracy.
-        """
-        try:
-            manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+    def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]], **kwargs):
 
-            total_skipped_params = 0
-            embedding_modules = []
+        num_examples = batch['prompt_input_ids'].shape[0]
+        
+        concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
 
-            for module in self.model.modules():
-                if isinstance(module, nn.Embedding):
-                    # Calculate parameter count for each Embedding module
-                    module_params = sum(p.numel() for p in module.parameters())
-                    total_skipped_params += module_params
+        model_kwargs = {}
 
-                    # Register modules to keep weights in fp32
-                    manager.register_module_override(module, "weight", {"optim_bits": 32})
-                    embedding_modules.append((module.__class__.__name__, module_params))
+        if self.aux_loss_enabled:
+            model_kwargs['output_router_logits'] = True
+        
+        prompt_input_ids = concatenated_batch["prompt_input_ids"]
+        prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
+        completion_input_ids = concatenated_batch["completion_input_ids"]
+        completion_attention_mask = concatenated_batch["completion_attention_mask"]
+        
+        input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
+        attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+        loss_mask = torch.cat(
+            (torch.zeros_like(prompt_attention_mask), completion_attention_mask), dim=1
+        )
 
-            # Logging
-            if embedding_modules:
-                logger.info(f"BitsAndBytes: Optimizing {len(embedding_modules)} embedding layer(s) in fp32")
-                logger.info(f"Total embedding parameters kept in fp32: {total_skipped_params / MB_TO_BYTES:.2f}M")
+        # Flush left to reduce the memory usage
+        # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
+        #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
+        attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
 
-                for module_name, param_count in embedding_modules:
-                    logger.debug(f"  - {module_name}: {param_count / MB_TO_BYTES:.2f}M params")
+        model_kwargs["attention_mask"] = attention_mask
 
-        except Exception as e:
-            logger.error(f"Failed to configure BitsAndBytes optimizer: {e}")
-            logger.warning("Proceeding without fp32 embedding optimization.")
+        outputs = model(input_ids, **model_kwargs)
+        logits = outputs.logits
 
+        labels = torch.roll(input_ids, shifts=-1, dims=1)
+        loss_mask = torch.roll(loss_mask, shifts=-1, dims=1).bool()
+
+        if logits.shape[:2] != labels.shape[:2]:
+            # for llava, the returned logits include the image tokens (placed before the text tokens)
+            seq_len = labels.shape[1]
+            logits = logits[:, -seq_len:]
+
+        # Compute the log probabilities of the labels
+        labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
+        per_token_logps = selective_log_softmax(logits, labels)
+        per_token_logps[~loss_mask] = 0
+        per_token_logps = torch.roll(per_token_logps, shifts=1, dims=1)
+
+        all_logps = per_token_logps.sum(-1)
+
+        output = {}
+
+        if self.use_weighting:
+            with torch.no_grad():
+                # Eq (2) of the WPO paper: https://huggingface.co/papers/2406.11827
+                logprobs = F.log_softmax(logits, dim=-1)
+                weights_adjustment_factor = torch.logsumexp(2 * logprobs, dim=-1)  # same as sum(probs**2) in log space
+                per_token_logps_adjusted = per_token_logps - weights_adjustment_factor
+                all_weights = (per_token_logps_adjusted * loss_mask).sum(-1) / loss_mask.sum(-1)
+                chosen_weights = all_weights[:num_examples]
+                rejected_weights = all_weights[num_examples:]
+                output["policy_weights"] = torch.clamp(torch.exp(chosen_weights + rejected_weights), max=1)
+
+        if self.args.rpo_alpha is not None:
+            # Only use the chosen logits for the RPO loss
+            chosen_logits = logits[:num_examples]
+            chosen_labels = labels[:num_examples]
+
+            # Compute the log probabilities of the labels
+            output["nll_loss"] = F.cross_entropy(
+                torch.flatten(chosen_logits, end_dim=1), torch.flatten(chosen_labels, end_dim=1), ignore_index=0
+            )
+
+        if self.loss_type == "ipo":
+            all_logps = all_logps / loss_mask.sum(-1)
+
+        output["chosen_logps"] = all_logps[:num_examples]
+        output["rejected_logps"] = all_logps[num_examples:]
+        output["mean_chosen_logits"] = logits[:num_examples][loss_mask[:num_examples]].mean()
+        output["mean_rejected_logits"] = logits[num_examples:][loss_mask[num_examples:]].mean()
+
+        if self.aux_loss_enabled:
+            output["aux_loss"] = outputs.aux_loss
+
+        return output
+    
     def _save_checkpoint(self, model: torch.nn.Module, trial: Optional[Any] = None) -> None:
         """
         Save checkpoint. Apply custom saving logic when using LoRA.
